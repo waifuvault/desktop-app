@@ -11,7 +11,6 @@ import (
 	"fyne.io/fyne/v2/layout"
 	"fyne.io/fyne/v2/widget"
 	"image/color"
-	"strconv"
 )
 
 func main() {
@@ -63,22 +62,6 @@ func chooseDirectory(w fyne.Window, h binding.String) {
 	}, w)
 }
 
-func onEnter(value string, result binding.String) {
-	if value == "" {
-		result.Set("value can not be empty")
-		return
-	}
-	s, err := strconv.Atoi(value)
-	if err != nil {
-		result.Set(value + " is not a valid year")
-		return
-	}
-	result.Set("is " + value + " a leap year? " + strconv.FormatBool(isLeap(s)))
-}
-
-func isLeap(year int) bool {
-	return year%4 == 0 && year%100 != 0 || year%400 == 0
-}
 func createCenteredComponents(components ...fyne.CanvasObject) *fyne.Container {
 	return container.New(layout.NewHBoxLayout(), layout.NewSpacer(), container.NewWithoutLayout(components...), layout.NewSpacer())
 }
