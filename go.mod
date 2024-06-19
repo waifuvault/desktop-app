@@ -1,4 +1,4 @@
-module go-scratchpad
+module waifuvault
 
 go 1.22
 
