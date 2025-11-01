@@ -7,7 +7,8 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
-	"time"
+	"sync"
+	"sync/atomic"
 
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/app"
@@ -21,18 +22,25 @@ import (
 	waifuMod "github.com/waifuvault/waifuVault-go-api/pkg/mod"
 )
 
+type FileItem struct {
+	path  string
+	name  string
+	size  int64
+	url   string
+	token string
+}
+
 type AppState struct {
-	api            waifuMod.Waifuvalt
-	window         fyne.Window
-	filePath       binding.String
-	fileName       binding.String
-	fileSize       binding.String
-	urlBind        binding.String
-	tokenBind      binding.String
-	isUploading    binding.Bool
-	uploadProgress binding.Float
-	uploadComplete binding.Bool
-	statusMessage  binding.String
+	api              waifuMod.Waifuvalt
+	window           fyne.Window
+	files            []FileItem
+	filesContainer   *fyne.Container
+	resultsContainer *fyne.Container
+	uploadButton     *widget.Button
+	isUploading      binding.Bool
+	uploadProgress   binding.Float
+	uploadComplete   binding.Bool
+	statusMessage    binding.String
 }
 
 func main() {
@@ -45,17 +53,15 @@ func main() {
 	w.SetFixedSize(false)
 
 	state := &AppState{
-		api:            api,
-		window:         w,
-		filePath:       binding.NewString(),
-		fileName:       binding.NewString(),
-		fileSize:       binding.NewString(),
-		urlBind:        binding.NewString(),
-		tokenBind:      binding.NewString(),
-		isUploading:    binding.NewBool(),
-		uploadProgress: binding.NewFloat(),
-		uploadComplete: binding.NewBool(),
-		statusMessage:  binding.NewString(),
+		api:              api,
+		window:           w,
+		files:            []FileItem{},
+		filesContainer:   container.NewVBox(),
+		resultsContainer: container.NewVBox(),
+		isUploading:      binding.NewBool(),
+		uploadProgress:   binding.NewFloat(),
+		uploadComplete:   binding.NewBool(),
+		statusMessage:    binding.NewString(),
 	}
 
 	state.statusMessage.Set("Ready to upload")
@@ -65,11 +71,12 @@ func main() {
 
 	// Handle drag and drop
 	w.SetOnDropped(func(position fyne.Position, uris []fyne.URI) {
-		if len(uris) != 1 {
-			showNotification(state, "Please drop only one file at a time", true)
+		if len(uris) == 0 {
 			return
 		}
-		handleFileSelection(state, uris[0].Path())
+		for _, uri := range uris {
+			addFileToList(state, uri.Path())
+		}
 	})
 
 	w.ShowAndRun()
@@ -149,37 +156,27 @@ func createDropZone(state *AppState) fyne.CanvasObject {
 }
 
 func createFileInfoCard(state *AppState) fyne.CanvasObject {
-	fileNameLabel := widget.NewLabelWithData(state.fileName)
-	fileNameLabel.TextStyle = fyne.TextStyle{Bold: true}
-	fileNameLabel.Wrapping = fyne.TextWrapBreak
-
-	fileSizeLabel := widget.NewLabelWithData(state.fileSize)
-	fileSizeLabel.TextStyle = fyne.TextStyle{Italic: true}
-
-	fileIcon := widget.NewIcon(theme.FileIcon())
-
-	infoContent := container.NewBorder(
+	header := container.NewBorder(
 		nil, nil,
-		fileIcon,
-		nil,
-		container.NewVBox(fileNameLabel, fileSizeLabel),
+		widget.NewLabel("Selected Files"),
+		widget.NewButton("Clear All", func() {
+			state.files = []FileItem{}
+			state.filesContainer.Objects = []fyne.CanvasObject{}
+			state.filesContainer.Refresh()
+			state.uploadComplete.Set(false)
+			state.statusMessage.Set("Ready to upload")
+
+			// Update button state
+			updateUploadButtonState(state)
+		}),
 	)
 
-	card := widget.NewCard("", "", infoContent)
+	scrollContainer := container.NewVScroll(state.filesContainer)
+	scrollContainer.SetMinSize(fyne.NewSize(0, 150))
 
-	cardContainer := container.NewVBox(card)
-	cardContainer.Hide()
+	card := widget.NewCard("", "", container.NewBorder(header, nil, nil, nil, scrollContainer))
 
-	state.fileName.AddListener(binding.NewDataListener(func() {
-		name, _ := state.fileName.Get()
-		if name != "" {
-			cardContainer.Show()
-		} else {
-			cardContainer.Hide()
-		}
-	}))
-
-	return cardContainer
+	return card
 }
 
 func createProgressCard(state *AppState) fyne.CanvasObject {
@@ -209,74 +206,43 @@ func createProgressCard(state *AppState) fyne.CanvasObject {
 }
 
 func createUploadButton(state *AppState) fyne.CanvasObject {
-	uploadBtn := widget.NewButtonWithIcon("Upload File", theme.UploadIcon(), func() {
+	uploadBtn := widget.NewButtonWithIcon("Upload Files", theme.UploadIcon(), func() {
 		performUpload(state)
 	})
 	uploadBtn.Importance = widget.HighImportance
 	uploadBtn.Disable()
 
-	state.filePath.AddListener(binding.NewDataListener(func() {
-		path, _ := state.filePath.Get()
-		uploading, _ := state.isUploading.Get()
-		if path != "" && !uploading {
-			uploadBtn.Enable()
-		} else {
-			uploadBtn.Disable()
-		}
-	}))
+	state.uploadButton = uploadBtn
 
 	state.isUploading.AddListener(binding.NewDataListener(func() {
-		uploading, _ := state.isUploading.Get()
-		if uploading {
-			uploadBtn.Disable()
-		} else {
-			path, _ := state.filePath.Get()
-			if path != "" {
-				uploadBtn.Enable()
-			}
-		}
+		updateUploadButtonState(state)
 	}))
 
 	return container.NewCenter(uploadBtn)
 }
 
+func updateUploadButtonState(state *AppState) {
+	if state.uploadButton == nil {
+		return
+	}
+
+	uploading, _ := state.isUploading.Get()
+	if uploading {
+		state.uploadButton.Disable()
+	} else {
+		if len(state.files) > 0 {
+			state.uploadButton.Enable()
+		} else {
+			state.uploadButton.Disable()
+		}
+	}
+}
+
 func createResultsCard(state *AppState) fyne.CanvasObject {
-	urlEntry := widget.NewEntryWithData(state.urlBind)
-	urlEntry.Disable()
+	scrollContainer := container.NewVScroll(state.resultsContainer)
+	scrollContainer.SetMinSize(fyne.NewSize(0, 200))
 
-	tokenEntry := widget.NewEntryWithData(state.tokenBind)
-	tokenEntry.Disable()
-
-	copyUrlBtn := widget.NewButtonWithIcon("Copy URL", theme.ContentCopyIcon(), func() {
-		url, _ := state.urlBind.Get()
-		state.window.Clipboard().SetContent(url)
-		showNotification(state, "URL copied to clipboard!", false)
-	})
-
-	copyTokenBtn := widget.NewButtonWithIcon("Copy Token", theme.ContentCopyIcon(), func() {
-		token, _ := state.tokenBind.Get()
-		state.window.Clipboard().SetContent(token)
-		showNotification(state, "Token copied to clipboard!", false)
-	})
-
-	copyBothBtn := widget.NewButtonWithIcon("Copy Both", theme.ContentCopyIcon(), func() {
-		url, _ := state.urlBind.Get()
-		token, _ := state.tokenBind.Get()
-		both := fmt.Sprintf("URL: %s\nToken: %s", url, token)
-		state.window.Clipboard().SetContent(both)
-		showNotification(state, "URL and token copied to clipboard!", false)
-	})
-
-	urlRow := container.NewBorder(nil, nil, widget.NewLabel("URL:"), copyUrlBtn, urlEntry)
-	tokenRow := container.NewBorder(nil, nil, widget.NewLabel("Token:"), copyTokenBtn, tokenEntry)
-
-	resultsContent := container.NewVBox(
-		urlRow,
-		tokenRow,
-		container.NewCenter(copyBothBtn),
-	)
-
-	card := widget.NewCard("Upload Complete", "", resultsContent)
+	card := widget.NewCard("Upload Results", "", scrollContainer)
 
 	cardContainer := container.NewVBox(card)
 	cardContainer.Hide()
@@ -305,26 +271,86 @@ func createStatusBar(state *AppState) fyne.CanvasObject {
 	)
 }
 
-func handleFileSelection(state *AppState, path string) {
+func addFileToList(state *AppState, path string) {
 	fileInfo, err := os.Stat(path)
 	if err != nil {
-		showNotification(state, "Could not read file information", true)
+		state.statusMessage.Set("Could not read file information")
 		return
 	}
 
-	state.filePath.Set(path)
-	state.fileName.Set(filepath.Base(path))
-	state.fileSize.Set(formatFileSize(fileInfo.Size()))
+	// Check if file already exists
+	for _, f := range state.files {
+		if f.path == path {
+			state.statusMessage.Set("File already in list")
+			return
+		}
+	}
+
+	fileItem := FileItem{
+		path: path,
+		name: filepath.Base(path),
+		size: fileInfo.Size(),
+	}
+
+	state.files = append(state.files, fileItem)
+	updateFilesList(state)
 	state.uploadComplete.Set(false)
-	state.urlBind.Set("")
-	state.tokenBind.Set("")
-	state.statusMessage.Set(fmt.Sprintf("Ready to upload: %s", filepath.Base(path)))
+	state.statusMessage.Set(fmt.Sprintf("%d file(s) ready to upload", len(state.files)))
+
+	// Update button state
+	updateUploadButtonState(state)
+}
+
+func updateFilesList(state *AppState) {
+	state.filesContainer.Objects = []fyne.CanvasObject{}
+
+	for i, file := range state.files {
+		idx := i
+		fileIcon := widget.NewIcon(theme.FileIcon())
+
+		nameLabel := widget.NewLabel(file.name)
+		nameLabel.TextStyle = fyne.TextStyle{Bold: true}
+
+		sizeLabel := widget.NewLabel(formatFileSize(file.size))
+		sizeLabel.TextStyle = fyne.TextStyle{Italic: true}
+
+		removeBtn := widget.NewButtonWithIcon("", theme.DeleteIcon(), func() {
+			removeFileFromList(state, idx)
+		})
+		removeBtn.Importance = widget.LowImportance
+
+		fileRow := container.NewBorder(
+			nil, nil,
+			container.NewHBox(fileIcon, container.NewVBox(nameLabel, sizeLabel)),
+			removeBtn,
+		)
+
+		state.filesContainer.Add(fileRow)
+	}
+
+	state.filesContainer.Refresh()
+}
+
+func removeFileFromList(state *AppState, index int) {
+	if index >= 0 && index < len(state.files) {
+		state.files = append(state.files[:index], state.files[index+1:]...)
+		updateFilesList(state)
+
+		if len(state.files) == 0 {
+			state.statusMessage.Set("Ready to upload")
+		} else {
+			state.statusMessage.Set(fmt.Sprintf("%d file(s) ready to upload", len(state.files)))
+		}
+
+		// Update button state
+		updateUploadButtonState(state)
+	}
 }
 
 func chooseFile(state *AppState) {
-	fileDialog := dialog.NewFileOpen(func(file fyne.URIReadCloser, err error) {
+	dialog.ShowFileOpen(func(file fyne.URIReadCloser, err error) {
 		if err != nil {
-			showNotification(state, "Error opening file dialogue", true)
+			state.statusMessage.Set("Error opening file")
 			return
 		}
 
@@ -332,65 +358,150 @@ func chooseFile(state *AppState) {
 			return
 		}
 
-		handleFileSelection(state, file.URI().Path())
+		addFileToList(state, file.URI().Path())
 	}, state.window)
-
-	fileDialog.Resize(fyne.NewSize(800, 600))
-	fileDialog.Show()
 }
 
 func performUpload(state *AppState) {
-	path, _ := state.filePath.Get()
-	if path == "" {
-		showNotification(state, "No file selected", true)
+	if len(state.files) == 0 {
+		state.statusMessage.Set("No files selected")
 		return
 	}
 
 	state.isUploading.Set(true)
 	state.uploadProgress.Set(0)
-	state.statusMessage.Set("Preparing upload...")
 
 	go func() {
-		// Simulate progress updates
-		go func() {
-			for i := 0; i < 90; i += 10 {
-				time.Sleep(100 * time.Millisecond)
-				uploading, _ := state.isUploading.Get()
-				if !uploading {
+		totalFiles := len(state.files)
+		state.statusMessage.Set(fmt.Sprintf("Uploading %d file(s) in parallel...", totalFiles))
+		var wg sync.WaitGroup
+		var completedCount int32
+		var failedCount int32
+		var mu sync.Mutex
+
+		// Launch a goroutine for each file
+		for i := range state.files {
+			wg.Add(1)
+			go func(index int) {
+				defer wg.Done()
+
+				fileStruc, err := os.Open(state.files[index].path)
+				if err != nil {
+					atomic.AddInt32(&failedCount, 1)
+					state.statusMessage.Set(fmt.Sprintf("Error opening file %s: %v", state.files[index].name, err))
 					return
 				}
-				state.uploadProgress.Set(float64(i) / 100.0)
-			}
-		}()
+				defer fileStruc.Close()
 
-		state.statusMessage.Set("Uploading file...")
+				resp, err := state.api.UploadFile(context.TODO(), waifuMod.WaifuvaultPutOpts{
+					File: fileStruc,
+				})
 
-		fileStruc, err := os.Open(path)
-		if err != nil {
-			state.isUploading.Set(false)
-			showNotification(state, fmt.Sprintf("Error opening file: %v", err), true)
-			return
+				if err != nil {
+					atomic.AddInt32(&failedCount, 1)
+					state.statusMessage.Set(fmt.Sprintf("Upload failed for %s: %v", state.files[index].name, err))
+					return
+				}
+
+				// Store URL and token in the file item (with mutex to avoid race conditions)
+				mu.Lock()
+				state.files[index].url = resp.URL
+				state.files[index].token = resp.Token
+				mu.Unlock()
+
+				// Update progress
+				completed := atomic.AddInt32(&completedCount, 1)
+				progress := float64(completed) / float64(totalFiles)
+				state.uploadProgress.Set(progress)
+				state.statusMessage.Set(fmt.Sprintf("Uploaded %d of %d files", completed, totalFiles))
+			}(i)
 		}
-		defer fileStruc.Close()
 
-		resp, err := state.api.UploadFile(context.TODO(), waifuMod.WaifuvaultPutOpts{
-			File: fileStruc,
-		})
-
-		if err != nil {
-			state.isUploading.Set(false)
-			state.uploadProgress.Set(0)
-			showNotification(state, fmt.Sprintf("Upload failed: %v", err), true)
-			return
-		}
+		// Wait for all uploads to complete
+		wg.Wait()
 
 		state.uploadProgress.Set(1.0)
-		state.urlBind.Set(resp.URL)
-		state.tokenBind.Set(resp.Token)
+		updateResultsList(state)
 		state.isUploading.Set(false)
 		state.uploadComplete.Set(true)
-		state.statusMessage.Set("Upload successful!")
+
+		failed := atomic.LoadInt32(&failedCount)
+		if failed > 0 {
+			state.statusMessage.Set(fmt.Sprintf("Upload complete: %d succeeded, %d failed", totalFiles-int(failed), failed))
+		} else {
+			state.statusMessage.Set(fmt.Sprintf("Successfully uploaded all %d file(s)!", totalFiles))
+		}
 	}()
+}
+
+func updateResultsList(state *AppState) {
+	state.resultsContainer.Objects = []fyne.CanvasObject{}
+
+	for _, file := range state.files {
+		if file.url == "" {
+			continue
+		}
+
+		fileIcon := widget.NewIcon(theme.ConfirmIcon())
+
+		nameLabel := widget.NewLabel(file.name)
+		nameLabel.TextStyle = fyne.TextStyle{Bold: true}
+
+		urlLabel := widget.NewLabel(file.url)
+		urlLabel.Wrapping = fyne.TextWrapBreak
+
+		tokenLabel := widget.NewLabel(file.token)
+		tokenLabel.Wrapping = fyne.TextWrapBreak
+
+		copyUrlBtn := widget.NewButtonWithIcon("", theme.ContentCopyIcon(), func(url string) func() {
+			return func() {
+				state.window.Clipboard().SetContent(url)
+				state.statusMessage.Set("URL copied!")
+			}
+		}(file.url))
+		copyUrlBtn.Importance = widget.LowImportance
+
+		copyTokenBtn := widget.NewButtonWithIcon("", theme.ContentCopyIcon(), func(token string) func() {
+			return func() {
+				state.window.Clipboard().SetContent(token)
+				state.statusMessage.Set("Token copied!")
+			}
+		}(file.token))
+		copyTokenBtn.Importance = widget.LowImportance
+
+		copyBothBtn := widget.NewButtonWithIcon("Copy Both", theme.ContentCopyIcon(), func(url, token string) func() {
+			return func() {
+				both := fmt.Sprintf("URL: %s\nToken: %s", url, token)
+				state.window.Clipboard().SetContent(both)
+				state.statusMessage.Set("URL and token copied!")
+			}
+		}(file.url, file.token))
+		copyBothBtn.Importance = widget.LowImportance
+
+		urlHeader := widget.NewLabel("URL:")
+		urlHeader.TextStyle = fyne.TextStyle{Bold: true}
+
+		tokenHeader := widget.NewLabel("Token:")
+		tokenHeader.TextStyle = fyne.TextStyle{Bold: true}
+
+		urlRow := container.NewBorder(nil, nil, nil, copyUrlBtn, urlLabel)
+		tokenRow := container.NewBorder(nil, nil, nil, copyTokenBtn, tokenLabel)
+
+		fileResult := container.NewVBox(
+			container.NewHBox(fileIcon, nameLabel),
+			widget.NewSeparator(),
+			urlHeader,
+			urlRow,
+			tokenHeader,
+			tokenRow,
+			container.NewCenter(copyBothBtn),
+		)
+
+		card := widget.NewCard("", "", fileResult)
+		state.resultsContainer.Add(card)
+	}
+
+	state.resultsContainer.Refresh()
 }
 
 func showNotification(state *AppState, message string, isError bool) {
