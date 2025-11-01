@@ -3,5 +3,6 @@ Website = "https://waifuvault.moe"
 [Details]
   Icon = "08.png"
   Name = "Waifuvault"
+  ID = "moe.waifuvault.desktop"
   Version = "1.0.0"
   Build = 6
